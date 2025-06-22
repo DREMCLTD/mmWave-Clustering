@@ -55,27 +55,71 @@ configCommands = [
     "sensorStart"
 ]
 
+# RIS mapping dictionaries.
+positive_image_data = {
+    7: 0, 8: 10, 9: 20, 10: 30, 11: 40, 12: 50, 13: 60, 14: 70, 15: 80, 16: 90,
+    17: 3, 18: 12, 19: 18, 20: 24, 21: 30, 22: 36, 23: 42, 24: 48, 25: 54, 26: 60
+}
+negative_image_data = {
+    38: -3, 39: -6, 40: -12, 41: -18, 42: -21, 43: -24, 44: -27, 45: -30,
+    46: -33, 47: -39, 48: -42, 49: -45, 50: -48, 51: -51, 52: -54, 53: -57,
+    54: -60, 55: -63, 56: -66, 57: -69
+}
+
+def find_closest_image(angle_hor):
+    image_data = positive_image_data if angle_hor >= 0 else negative_image_data
+    closest_image = None
+    min_diff = float('inf')
+    for image, theta in image_data.items():
+        diff = abs(theta - angle_hor)
+        if diff < min_diff:
+            min_diff = diff
+            closest_image = image
+    return closest_image
+
+def send_image_to_serial(image_index):
+    port = serial.Serial(port='COM5', baudrate=9600, timeout=10)
+    port.set_buffer_size(rx_size=1, tx_size=1)
+    port.reset_input_buffer()
+    port.reset_output_buffer()
+    if not port.is_open:
+        port.open()
+    port.write(bytearray([image_index]))
+    time.sleep(10e-3)
+    port.close()
+
+# Helper function to flip horizontal axis (multiply x values by -1).
+def flip_x(points):
+    new_points = points.copy()
+    new_points[:, 0] = -new_points[:, 0]
+    return new_points
+
 ###################
 # Kalman Filter Class 
 ####################
 class KalmanFilter:
     def __init__(self, dt):
-        # State vector: [x, y, vx, vy, aoa]
         self.dt = dt
-        self.x = np.zeros((5, 1))
-        self.F = np.array([[1, 0, dt,  0,  0],
-                           [0, 1,  0, dt,  0],
-                           [0, 0,  1,  0,  0],
-                           [0, 0,  0,  1,  0],
-                           [0, 0,  0,  0,  1]])
-        self.H = np.array([[1, 0, 0, 0, 0],
-                           [0, 1, 0, 0, 0],
-                           [0, 0, 0, 0, 1]])
-        self.P = np.eye(5) * 500
-        # Increased process noise covariance for faster response
-        self.Q = np.eye(5) * 1.0  
-        # Decreased measurement noise covariance to trust measurements more
-        self.R = np.eye(3) * 1.0  
+        # State: [x, y, vx, vy, azimuth, z, vz]
+        self.x = np.zeros((7, 1))
+        self.F = np.array([
+            [1, 0, dt,  0,  0, 0,  0],
+            [0, 1,  0, dt,  0, 0,  0],
+            [0, 0,  1,  0,  0, 0,  0],
+            [0, 0,  0,  1,  0, 0,  0],
+            [0, 0,  0,  0,  1, 0,  0],
+            [0, 0,  0,  0,  0, 1, dt],
+            [0, 0,  0,  0,  0, 0,  1],
+        ])
+        self.H = np.array([
+            [1, 0, 0, 0, 0, 0, 0],  # x
+            [0, 1, 0, 0, 0, 0, 0],  # y
+            [0, 0, 0, 0, 1, 0, 0],  # azimuth
+            [0, 0, 0, 0, 0, 1, 0],  # z
+        ])
+        self.P = np.eye(7) * 500
+        self.Q = np.eye(7) * 1.0
+        self.R = np.eye(4) * 1.0
 
     def predict(self):
         self.x = self.F @ self.x
@@ -83,7 +127,7 @@ class KalmanFilter:
         return self.x
 
     def update(self, z):
-        z = np.reshape(z, (3,1))
+        z = np.reshape(z, (4, 1))
         y = z - self.H @ self.x
         S = self.H @ self.P @ self.H.T + self.R
         K = self.P @ self.H.T @ np.linalg.inv(S)
@@ -97,11 +141,10 @@ class KalmanFilter:
 ####################
 def serialConfig():
     global CLIport, Dataport
-    CLIport = serial.Serial('COM6', 115200)
-    Dataport = serial.Serial('COM7', 921600)
+    CLIport = serial.Serial('COM3', 115200)
+    Dataport = serial.Serial('COM4', 921600)
     for command in configCommands:
         CLIport.write((command + '\n').encode())
-        print(command)
         time.sleep(0.01)
     return CLIport, Dataport
 
@@ -211,13 +254,13 @@ def readAndParseData14xx(Dataport, configParameters):
     return dataOK, frameNumber, detObj
 
 class SerialReader(QtCore.QThread):
-    newData = QtCore.pyqtSignal(object, object, object, object, object)
+    newData = QtCore.pyqtSignal(object, object, object, object, object, object, object)
     def run(self):
         global Dataport, configParameters
         while True:
             dataOk, frameNumber, detObj = readAndParseData14xx(Dataport, configParameters)
-            if dataOk and len(detObj.get("x", [])) > 0 and "azimuth" in detObj and "snr" in detObj and "v" in detObj:
-                self.newData.emit(detObj["x"], detObj["y"], detObj["azimuth"], detObj["snr"], detObj["v"])
+            if dataOk and len(detObj.get("x", [])) > 0 and "azimuth" in detObj and "snr" in detObj and "v" in detObj and "range" in detObj:
+                self.newData.emit(detObj["x"], detObj["y"], detObj["z"], detObj["azimuth"], detObj["snr"], detObj["v"], detObj["range"])
             self.msleep(10)
 
 class MyWidget(pg.GraphicsLayoutWidget):
@@ -265,7 +308,7 @@ class MyWidget(pg.GraphicsLayoutWidget):
         # RIS confirmation variables.
         self.last_confirmed_AoA = None
         self.confirmation_count = 0
-        self.confirmation_threshold = 2  # require 2 consecutive frames
+        self.confirmation_threshold = 2  # require  consecutive frames
         self.AoA_tolerance = 1.0  # tolerance in degrees
 
         self.grid_resolution = 0.1
@@ -275,26 +318,21 @@ class MyWidget(pg.GraphicsLayoutWidget):
         self.y_max = 5
         self.num_x = int((self.x_max - self.x_min) / self.grid_resolution)
         self.num_y = int((self.y_max - self.y_min) / self.grid_resolution)
-                                                                                
         self.background_count = np.zeros((self.num_y, self.num_x))
         self.bg_decay = 0.95
         self.bg_threshold = 30
 
-                                              
         self.lastBestCluster = None
         self.lastBestAoA = None
-                                              
         self.missing_cluster_frames = 0
         self.max_missing_frames = 20
         self.dt = 0.1
 
-                                                         
         self.lastAoALabel = pg.TextItem("", color="w", anchor=(1,1))
         self.lastAoALabel.setFont(pg.QtGui.QFont("Arial", 16, pg.QtGui.QFont.Bold))
         self.plotItem.addItem(self.lastAoALabel, ignoreBounds=True)
         self.lastAoALabel.setPos(2, 5)
 
-                                                                    
         self.kf = KalmanFilter(dt=0.1)
         self.kf_initialized = False
 
@@ -305,11 +343,12 @@ class MyWidget(pg.GraphicsLayoutWidget):
     def onToggleClustering(self, checked):
         self.enableClustering = checked
 
-    def updatePlot(self, x, y, az, snr, v):
+    def updatePlot(self, x, y, z, az, snr, v):
         self.updateCounter += 1
         # Flip the horizontal axis: multiply x values by -1.
-        newPoints = np.column_stack((x, y))
-        newPoints = flip_x(newPoints)
+        newPoints = np.column_stack((x, y, z))
+        newPoints[:, 0] *= -1  # flip x 
+
         newAz = np.array(az)
         # Invert the AoA as well to match the x flip.
         newAz = -newAz
@@ -326,7 +365,7 @@ class MyWidget(pg.GraphicsLayoutWidget):
             aggregatedSNR = np.hstack([fb[2] for fb in self.frameBuffer])
             aggregatedV = np.hstack([fb[3] for fb in self.frameBuffer])
         else:
-            aggregatedPoints = np.empty((0,2))
+            aggregatedPoints = np.empty((0,3))
             aggregatedAz = np.empty((0,))
             aggregatedSNR = np.empty((0,))
             aggregatedV = np.empty((0,))
@@ -404,7 +443,7 @@ class MyWidget(pg.GraphicsLayoutWidget):
             else:
                 eps = base_eps
 
-            dbscan = DBSCAN(eps=eps, min_samples=4)
+            dbscan = DBSCAN(eps=eps, min_samples=10)
             labels = dbscan.fit_predict(filtered_points_no_bg)
             unique_labels = set(labels)
             if -1 in unique_labels:
@@ -481,20 +520,48 @@ class MyWidget(pg.GraphicsLayoutWidget):
                         if self.lastBestCluster is not None:
                             vertical_diff = abs(best_cluster_centroid[1] - self.lastBestCluster[1])
                             if vertical_diff < vertical_threshold:
-                                                                                                 
                                 best_cluster_centroid = self.lastBestCluster
                                 best_cluster_az = self.lastBestAoA
                             else:
-                                z = np.array([best_cluster_centroid[0], best_cluster_centroid[1], best_cluster_az])
-                                self.kf.update(z)
+                                z_kf = np.array([
+                                best_cluster_centroid[0],  # x
+                                best_cluster_centroid[1],  # y
+                                best_cluster_az,           # azimuth
+                                best_cluster_centroid[2],  # z
+                                ])
+                                self.kf.update(z_kf)
                                 pred_state = self.kf.predict()
-                                best_cluster_centroid = np.array([pred_state[0, 0], pred_state[1, 0]])
+                                best_cluster_centroid = np.array([
+                                pred_state[0, 0],  # x
+                                pred_state[1, 0],  # y
+                                pred_state[5, 0],  # z
+                                ])
+                                best_cluster_az = pred_state[4, 0]
+                                pred_state = self.kf.predict()
+                                best_cluster_centroid = np.array([
+                                    pred_state[0, 0],  # x
+                                    pred_state[1, 0],  # y
+                                    pred_state[5, 0],  # z
+                                ])
                                 best_cluster_az = pred_state[4, 0]
                         else:
-                            z = np.array([best_cluster_centroid[0], best_cluster_centroid[1], best_cluster_az])
-                            self.kf.update(z)
+                            z_kf = np.array([
+                            best_cluster_centroid[0],  # x
+                            best_cluster_centroid[1],  # y
+                            best_cluster_az,           # azimuth
+                            best_cluster_centroid[2],  # z
+                        ])
+                            self.kf.update(z_kf)
                             pred_state = self.kf.predict()
-                            best_cluster_centroid = np.array([pred_state[0, 0], pred_state[1, 0]])
+                            best_cluster_centroid = np.array([
+                            pred_state[0, 0],  # x
+                            pred_state[1, 0],  # y
+                            pred_state[5, 0],  # z
+                        ])
+                            best_cluster_az = pred_state[4, 0]
+
+                            pred_state = self.kf.predict()
+                            best_cluster_centroid = np.array([pred_state[0, 0], pred_state[1, 0], pred_state[5, 0]])
                             best_cluster_az = pred_state[4, 0]
                     # -------------------------------------------------------------
                     
@@ -529,6 +596,23 @@ class MyWidget(pg.GraphicsLayoutWidget):
                     rect_item.setPen(pg.mkPen(color=(255, 0, 0), width=2))
                     self.plotItem.addItem(rect_item)
                     self.bboxItems.append(rect_item)
+                    
+                    # --- RIS Code Group ---
+                    if self.last_confirmed_AoA is None:
+                        self.last_confirmed_AoA = best_cluster_az
+                        self.confirmation_count = 1
+                    else:
+                        if abs(best_cluster_az - self.last_confirmed_AoA) < self.AoA_tolerance:
+                            self.confirmation_count += 1
+                        else:
+                            self.confirmation_count = 0
+                            self.last_confirmed_AoA = best_cluster_az
+                    if self.confirmation_count >= self.confirmation_threshold:
+                        image_index = find_closest_image(best_cluster_az)
+                        send_image_to_serial(image_index)
+                        print(f"RIS configuration sent for AoA {best_cluster_az:.1f}° (Image {image_index})")
+                        self.confirmation_count = 0
+                    # -----------------------
                     
                 else:
                     self.missing_cluster_frames = 0
